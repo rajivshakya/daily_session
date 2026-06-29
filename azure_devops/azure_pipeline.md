@@ -900,3 +900,417 @@ Industry Best Practice:
 - Artifact Based Deployment
 - Git Version Control
 - Infrastructure as Code
+
+# Azure DevOps Agent Pool Scope
+
+## What is an Agent Pool?
+
+An **Agent Pool** is a collection of one or more agents (Microsoft-hosted or Self-hosted) that execute pipeline jobs.
+
+Example:
+
+```text
+Terraform-Agent-Pool
+    ├── Agent-01
+    ├── Agent-02
+    └── Agent-03
+```
+
+Whenever a pipeline runs, Azure DevOps allocates one available agent from the specified pool to execute the job.
+
+---
+
+# Pool Scope
+
+An Agent Pool can be defined at three different levels.
+
+1. Pipeline Level
+2. Stage Level
+3. Job Level
+
+Priority:
+
+```text
+Job Level
+    ↑
+Stage Level
+    ↑
+Pipeline Level
+```
+
+The more specific scope always overrides the broader scope.
+
+For example:
+
+- Job Level overrides Stage Level.
+- Stage Level overrides Pipeline Level.
+
+---
+
+# 1. Pipeline Level Pool
+
+```yaml
+pool:
+  name: Terraform-Agent-Pool
+
+stages:
+
+- stage: Validation
+
+  jobs:
+
+  - job: Validate
+
+    steps:
+    - script: terraform validate
+```
+
+## Explanation
+
+The pool is defined once at the pipeline level.
+
+Every stage and every job automatically uses **Terraform-Agent-Pool**, unless another pool is explicitly defined.
+
+This is the most common approach when every stage requires the same Self-hosted Agent.
+
+---
+
+# 2. Stage Level Pool
+
+```yaml
+stages:
+
+- stage: Validation
+
+  pool:
+    name: Linux-Agent-Pool
+
+  jobs:
+
+  - job: Validate
+
+    steps:
+    - script: terraform validate
+```
+
+## Explanation
+
+The pool applies only to the jobs inside the **Validation** stage.
+
+Other stages can use different pools.
+
+Example:
+
+```text
+Validation Stage
+        │
+        ▼
+Linux-Agent-Pool
+
+
+Deployment Stage
+        │
+        ▼
+Windows-Agent-Pool
+```
+
+---
+
+# 3. Job Level Pool
+
+```yaml
+stages:
+
+- stage: Deployment
+
+  jobs:
+
+  - job: Apply
+
+    pool:
+      name: Terraform-Agent-Pool
+
+    steps:
+
+    - script: terraform apply
+```
+
+## Explanation
+
+Only this job uses **Terraform-Agent-Pool**.
+
+Other jobs inside the same stage can use different pools.
+
+Job Level has the highest priority.
+
+---
+
+# Why do we use `pool: server`?
+
+Consider the following example.
+
+```yaml
+trigger:
+  branches:
+    include:
+      - main
+
+stages:
+
+- stage: Approval
+
+  jobs:
+
+  - job: WaitForApproval
+
+    pool: server
+
+    steps:
+
+    - task: ManualValidation@0
+      inputs:
+        instructions: "Please review and approve deployment."
+```
+
+Many engineers become confused because the pipeline also contains a Self-hosted Agent Pool.
+
+Example:
+
+```yaml
+pool:
+  name: Terraform-Agent-Pool
+```
+
+So why is another pool specified?
+
+The reason is that the **Manual Validation** task does not execute any deployment commands.
+
+It only waits for someone to approve or reject the deployment.
+
+During this stage:
+
+- No Terraform commands are executed.
+- No Azure CLI commands are executed.
+- No Bash scripts are executed.
+- No PowerShell scripts are executed.
+- No Git checkout is required.
+
+Therefore, a Self-hosted Agent is not required.
+
+Instead, Azure DevOps executes this job internally using:
+
+```yaml
+pool: server
+```
+
+---
+
+# What happens if we do NOT use `pool: server`?
+
+Suppose the pipeline is written like this.
+
+```yaml
+pool:
+  name: Terraform-Agent-Pool
+
+stages:
+
+- stage: Approval
+
+  jobs:
+
+  - job: WaitForApproval
+
+    steps:
+
+    - task: ManualValidation@0
+```
+
+Since no Job Level pool is specified, Azure DevOps automatically uses the Pipeline Level pool.
+
+Execution:
+
+```text
+Terraform-Agent-Pool
+
+        │
+        ▼
+
+Self-hosted Agent Allocated
+
+        │
+        ▼
+
+Waiting for Approval...
+
+        │
+        ▼
+
+Waiting...
+
+        │
+        ▼
+
+Waiting...
+
+        │
+        ▼
+
+User Clicks Approve
+```
+
+During the entire approval period, the Self-hosted Agent remains occupied even though it is not executing any commands.
+
+This is considered inefficient because another pipeline cannot use that agent.
+
+---
+
+# Recommended Production Design
+
+```yaml
+stages:
+
+- stage: Approval
+
+  jobs:
+
+  - job: WaitForApproval
+
+    pool: server
+
+    steps:
+
+    - task: ManualValidation@0
+
+
+- stage: Deploy
+
+  jobs:
+
+  - job: TerraformApply
+
+    pool:
+      name: Terraform-Agent-Pool
+
+    steps:
+
+    - checkout: self
+
+    - script: terraform init
+
+    - script: terraform apply tfplan
+```
+
+Execution Flow:
+
+```text
+Merge to Main
+      │
+      ▼
+
+Approval Stage
+      │
+      ▼
+
+Azure DevOps Server
+(No Agent Required)
+
+      │
+      ▼
+
+Manager Approves Deployment
+
+      │
+      ▼
+
+Deploy Stage
+
+      │
+      ▼
+
+Self-hosted Agent Allocated
+
+      │
+      ▼
+
+Checkout Source Code
+
+      │
+      ▼
+
+Terraform Init
+
+      │
+      ▼
+
+Terraform Apply
+```
+
+---
+
+# Best Practice
+
+For production environments:
+
+- Use **Pipeline Level Pool** when all jobs require the same agent.
+- Use **Stage Level Pool** when different stages require different agents.
+- Use **Job Level Pool** when only a specific job requires a different agent.
+- Use **`pool: server`** for Manual Validation because it does not require an agent.
+- Allocate a Self-hosted Agent only when actual work such as Terraform, Azure CLI, Bash, or PowerShell execution is required.
+
+---
+
+# Interview Answer
+
+**Question: Why do we use `pool: server` for Manual Validation?**
+
+**Answer:**
+
+The Manual Validation task does not execute any deployment commands. It simply waits for an approval or rejection. Using `pool: server` allows Azure DevOps to handle the approval internally without reserving a Self-hosted Agent. This improves resource utilization because the Self-hosted Agent is allocated only when the deployment actually starts.
+
+
+# Agent Configuration
+# Azure CLi Install
+```bash
+curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+az login --use-device-code
+```
+# install terraform
+```bash
+sudo apt update
+sudo apt install -y gnupg software-properties-common curl
+
+wget -O- https://apt.releases.hashicorp.com/gpg | \
+gpg --dearmor | \
+sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg > /dev/null
+
+echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | \
+sudo tee /etc/apt/sources.list.d/hashicorp.list
+
+sudo apt update
+
+sudo apt install -y terraform
+
+terraform version
+```
+
+# Tflint Installation
+```bash
+wget https://github.com/terraform-linters/tflint/releases/latest/download/tflint_linux_amd64.zip
+
+sudo apt install -y unzip
+unzip tflint_linux_amd64.zip
+sudo mv tflint /usr/local/bin/
+chmod +x /usr/local/bin/tflint
+tflint --version
+```
+
+
+# TfSec Installation
+```bash
+wget https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-amd64
+
+chmod +x tfsec-linux-amd64
+sudo mv tfsec-linux-amd64 /usr/local/bin/tfsec
+tfsec --version
+```
